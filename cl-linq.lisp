@@ -22,6 +22,40 @@
    #:cl-linq-select))
 (in-package :cl-linq)
 
+(defclass column ()
+  ((test-function :reader test-function
+                  :initform #'equalp
+                  :initarg :test-function)))
+
+(defclass data-frame ()
+  (
+   (column-metadata
+    :accessor column-metadata
+    :initform nil
+    :initarg :column-metadata)
+   (data
+    :accessor data
+    :initform (make-array (list 1 0) :adjustable t)
+    :initarg :data)))
+
+(defun where (data-frame condition)
+  (let ((next-frame (make-data-frame
+                     (test-function data-frame))))
+    (loop for i from 0 to (length data-frame)
+         (when (funcall predicate
+                        (ref data-frame i))
+           (append-to next-frame)))
+    next-frame))
+
+(defun group-by (data-frame column-references)
+  ;;yea stuff here.
+  )
+
+(defun join (data-frame-a data-frame-b predicate)
+  ;; (when (funcall predicate row-a row-b)
+  ;;   (append-to next-frame))
+  )
+
 (defun selector-to-lambda (selector)
   "Convert a selector to a function."
   (typecase selector
