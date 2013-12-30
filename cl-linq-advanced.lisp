@@ -33,19 +33,21 @@
 
 (ql:quickload '(:cl-store
                 :alexandria
+                :local-time
                 :cl-containers))
 
-(defun map-with-index (type function first-sequence &rest sequences)
-  "Maps over `function`, passing in the index to the sequence as well
-as elements of the sequence. The underlying semantics are of MAP."
-  (let ((counter 0))
-    (apply #'map type
-           #'(lambda (&rest sequences)
-               (apply
-                function
-                (incf counter)
-               sequences))
-           first-sequence sequences)))
+(defparameter *debug* nil "Set to enable debug logging to *debug-stream*")
+(defparameter *debug-stream* t "Print to this stream")
+
+(defun debug-log (string)
+  "Prints `string` to a nicely formatted string"
+  (when *debug*
+    (format *debug-stream* "~&[~a] ~a~%" (local-time:now) string)))
+
+(defmacro with-debugging (&body body)
+  "Within this form, debug-log prints t"
+  `(let ((*debug* t))
+     ,@body))
 
 (defclass header ()
   ((canonical-name
@@ -126,25 +128,28 @@ as elements of the sequence. The underlying semantics are of MAP."
 (defmethod (setf data) :after (new-value (obj data-frame))
   (setf (data-count obj) (first (array-dimensions (data obj)))))
 
+(defun things-to-headers (thing-list)
+  (loop
+    for h in thing-list
+    for i from 0
+    collect
+    (etypecase h
+      (header
+       h)
+      (number
+       (make-instance 'header
+                      :canonical-name (format nil "~a" h)
+                      :canonical-index h))
+      (string
+       (make-instance 'header
+                      :canonical-name h
+                      :canonical-index i)))))
+
 (defmethod (setf headers) :after (new-headers (obj data-frame))
   (with-slots (headers)
       obj
       (setf headers
-            (loop
-              for h in new-headers
-              for i from 0
-                  collect
-                  (etypecase h
-                    (header
-                     h)
-                    (number
-                     (make-instance 'header
-                                    :canonical-name (format nil "~a" h)
-                                    :canonical-index h))
-                    (string
-                     (make-instance 'header
-                                    :canonical-name h
-                                    :canonical-index i)))))))
+            (things-to-headers new-headers))))
 
 (defgeneric cast-to-vector (source-object)
   (:documentation "Builds an array of arrays from source-object and returns
@@ -270,12 +275,16 @@ as elements of the sequence. The underlying semantics are of MAP."
        (setf data
              (make-instance 'data-frame :data data))))))
 
-(defmethod data :before ((page page))
-  "Automatically load up from the store if it isn't already there."
+(defmethod ensure-data ((page page))
   (with-slots (data)
       page
     (unless data
-      (load-page page))))
+      (load-page page)))
+  page)
+
+(defmethod data :before ((page page))
+  "Automatically load up from the store if it isn't already there."
+  (ensure-data page))
 
 (defmethod data :around ((page page))
 
@@ -296,24 +305,28 @@ as elements of the sequence. The underlying semantics are of MAP."
 (defmethod (setf data) :around (new-data (page page))
   (when (locked-p page)
     (error "Attempting to modify a locked page."))
+  ;; If it's being not being set to nil and it's not a data-frame...
   (if (and new-data
            (not (typep new-data 'data-frame)))
       (call-next-method (make-data-frame new-data) page)
       (call-next-method)))
 
-(defmethod lengthg ((obj page))
-  (lengthg (data-frame obj)))
+(defmethod lengthg ((page page))
+  (if (ensure-data page)
+      (lengthg (data-frame page ))
+      ;; This should only happen if the page was unloaded without flushing.
+      (error "Data missing")))
 
-(defmethod unload-page  ((page page))
+(defmethod unload-item  ((page page))
   (with-slots (data) page
     (setf data nil)))
 
-(defmethod load-page ((page page))
+(defmethod load-item ((page page))
   (setf (data page)
         (data (backing-store page))))
 
-(defmethod flush-page ((obj page))
-  (setf (data (backing-store obj)) obj))
+(defmethod flush-item ((page page))
+  (setf (data (backing-store page)) page))
 
 (defmethod headers ((page page))
   (headers (data-frame page)))
@@ -328,11 +341,7 @@ as elements of the sequence. The underlying semantics are of MAP."
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; The caching logic manages loading and unloading in smart ways.
-
-
-
-;; A kind of cache
+;;; The caching logic manages loading and unloading in reasonably smart ways.
 
 
 ;;; This is what can be put in a cache
@@ -347,10 +356,25 @@ as elements of the sequence. The underlying semantics are of MAP."
   not, and to which cache it belongs. Note that the current design only
   allows for belonging to one cache"))
 
+(defgeneric unload-item (item)
+  (:documentation "Unloads the internal backing data from memory"))
+
+(defgeneric flush-item (item)
+  (:documentation "A cachable item should occasionally flush to the
+  backing store in case it gets evicted"))
+
+(defgeneric load-item (item)
+  (:documentation "Loads item from its cache"))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Next up should be a tool to manage cache size automatically,
+;;; without the clients calling evict-to-size.
 (defclass cache ()
   ((size
     :accessor size
     :initform 0)
+
+   ;; This cache data structure ain't working out.
    (members
     :accessor members
     :initform (cl-containers:make-container 'cl-containers:heap-container)
@@ -369,14 +393,19 @@ as elements of the sequence. The underlying semantics are of MAP."
   determine if it is overflowing (and thus eviction time)"))
 
 
+;; This API is groady in names.
+
 (defmethod note-cached ((item cachable-item) (cache cache))
   (setf (cache item) cache)
   (setf (cached item) t))
 
 (defmethod note-uncached ((item cachable-item) (cache cache))
-;  (format t "~&~a is now uncached~%" item)
   (setf (cache item) nil)
   (setf (cached item) nil))
+
+
+;; Two things need to happen: adding the item to the cache-specific
+;; data structure and then fiddling the generic cache data bits.
 
 (defgeneric insert-cache-item (item cache)
   (:documentation "Insert cache item is intended to be only an
@@ -392,6 +421,8 @@ as elements of the sequence. The underlying semantics are of MAP."
 (defmethod delete-cache-item ((item cachable-item) (cache cache))
   (cl-containers:delete-item (members cache) item))
 
+
+;;;
 (defgeneric add-to-cache (item cache)
   (:documentation "add to cache calls insert-cache-item, which is
   expected to be implemented for a given cache type, and also handles
@@ -433,12 +464,28 @@ as elements of the sequence. The underlying semantics are of MAP."
     (remove-from-cache old-item cache))
   (decf (size cache)))
 
+(defmethod access ((item cachable-item) (cache cache))
+  (error "The generic cache isn't working out too well (some bugs got
+  in the hacker's head and left a mess). Advise using LRU-CACHE..."))
+
+
+;;; LRU performs well on hot data.
 (defclass lru-cache (cache)
   ((members
     :accessor members
     :initform nil
     :documentation "A LRU cache has a particular insertion/deletion
     pattern.")))
+
+;; Note that this implementation uses linked lists. A vector of
+;; limited size would be more useful. However, since the cache doesn't
+;; have an automatic eviction mechanism, vectors would require
+;; reallocs.
+
+;; One trick would be to use a hash table + a fixed-size vector. The
+;; hash table has fast add & delete. The vector is accessed as a
+;; circular buffer with overwrite; each access would stuff the
+;; accessing item on the top of the buffer if it didn't already exist there,
 
 (defmethod insert-cache-item ((item cachable-item) (cache lru-cache))
   ;; Remove remark of item in the history, then add it in on the top.
@@ -459,22 +506,17 @@ as elements of the sequence. The underlying semantics are of MAP."
 (defmethod access ((item cachable-item) (cache lru-cache))
   (insert-cache-item item cache))
 
+(defmethod data :after ((item cachable-item))
+  (access item (cache item)))
+
 (defmethod find-worst-item ((cache lru-cache))
   ;; In our LRU cache, the worst is the furthest back.
   (car (last (members cache))))
 
-(defmethod data :after ((item cachable-item))
-  (access item (cache item)))
-
-(defgeneric unload-item (cachable-item)
-  (:documentation "Unloads the internal backing data from memory"))
-
-(defgeneric flush-item (cachable-item)
-  (:documentation "A cachable item should occasionally flush to the
-  backing store in case it gets evicted"))
-
 ;;;;;;;;;;
-
+;;; Future-proofing note: Don't make this a class variable. Really
+;;; frustrating bugs relating to when the class instance was created
+;;; cropped up.
 (defparameter *page-cache*
   (make-instance 'lru-cache
                  :test #'eql))
@@ -482,26 +524,32 @@ as elements of the sequence. The underlying semantics are of MAP."
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; The page of the caching.
 (defclass caching-page (page cachable-item)
-  ())
+  ()
+  (:documentation "This serves as the apex of the page management plus
+  the cachable-item mixin"))
 
 (defmethod initialize-instance :after ((page caching-page) &key)
+  "Automatically add the page to the cache on creation."
   (add-to-cache page *page-cache*))
 
-(defmethod unload-item ((page caching-page))
-  (unload-page page))
+(defmethod unload-item :before ((page caching-page))
+  "Safely ensure that page is written out to its backing store before
+dropping it from memory."
+  (flush-item page))
 
 (defmethod unload-page :after ((page caching-page))
   (remove-from-cache page *page-cache*))
 
-(defmethod load-page :after ((page caching-page))
+(defmethod load-item :after ((page caching-page))
   (add-to-cache page *page-cache*))
 
-(defmethod flush-cached-pages ((cache cache))
+(defmethod flush-item ((cache cache))
   "Flushes the currently cached pages out to the backing store."
   (loop for page in *page-cache*
-        do (flush-page page)))
+        do (flush-item page)))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;; Different backing stores.
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 (defclass disk-store (store)
@@ -545,10 +593,14 @@ as elements of the sequence. The underlying semantics are of MAP."
   (error "Unimplemented"))
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; degenerate k-d tree partition.
+;; degenerate k-d tree.
 ;; points are composed of (x1 x2 data)
 ;; each range DOES NOT INTERSECT other ranges.
+;;; Note: No (add | delete | update) point routines. Just create and
+;;; search.
 (defun k-d-tree (points)
+  "Points should be (x0 x1 data) where x0 and x1 are unique and do not
+intersect any other x0,x1 in the system"
   (when points
     (let*
        ((points (copy-list points))
@@ -560,6 +612,7 @@ as elements of the sequence. The underlying semantics are of MAP."
       (k-d-tree (subseq points (1+ median-idx)))))))
 
 (defun find-nearest-key (kd-tree key)
+  "Determine the range that key lies between; return the data."
   (when kd-tree
     (let ((node (first kd-tree)))
       (cond
@@ -624,10 +677,20 @@ as elements of the sequence. The underlying semantics are of MAP."
     :accessor unanalyzed
     :documentation "Has the data been properly analyzed & prepared for
     any sort of analysis doable on static data?")
+   (accesses-to-next-eviction-default
+    :initform 10
+    :accessor accesses-to-next-eviction-default)
+   (accesses-to-next-eviction
+    :initform 10
+    :initarg :accesses-to-next-eviction
+    :accessor accesses-to-next-eviction
+    :documentation "When this counter reaches zero, the cache eviction
+    request is executed.")
    (page-key-index
     :initform nil
     :accessor page-key-index
-    :documentation "How to get to a given page very quickly")
+    :documentation "A tree indexing artifical keys (for access) into
+    pages. ")
    (size
     :initform nil
     :accessor size)
@@ -635,6 +698,10 @@ as elements of the sequence. The underlying semantics are of MAP."
           :accessor pages))
   (:documentation "A table contains all rows of a given columnar
     structure. This is done via the page mechanism. "))
+
+(defmethod initialize-instance :after ((table table) &key)
+  (let ((given-headers (headers table)))
+    (setf (headers table) (things-to-headers given-headers))))
 
 (defmethod create-index-on-keys ((table table))
   (let ((index
@@ -655,8 +722,8 @@ as elements of the sequence. The underlying semantics are of MAP."
   (setf (unanalyzed table) nil))
 
 (defmethod (setf root) (new-value (table table))
-
   (error "Unable to set table's root"))
+
 (defmethod root ((table table))
   ;; the root of table is actually the first page in pages
   table)
@@ -665,15 +732,39 @@ as elements of the sequence. The underlying semantics are of MAP."
   (setf (current-iterator table) 0)
   table)
 
-(defmethod current-page ((table table) index)
+(defmethod page-key-index :before ((table table))
+  (when (unanalyzed table)
+    (analyze-table table)))
+
+(defmethod cache ((table table))
+  (when (pages table)
+    (cache (aref (pages table) 0))))
+
+(defmethod flush-item ((table table))
+  (loop for page across (pages table)
+        do
+        (flush-item page)))
+
+(defmethod current-page ((table table))
+  (find-nearest-key (page-key-index table) (current-iterator table)))
+
+(defmethod page-with ((table table) index)
   (find-nearest-key (page-key-index table) index))
 
 (defmethod item-at ((table table) (index number))
   (let ((current-page
-          (current-page table index)))
+          (page-with table index)))
 
     (elt (data current-page)
          (- index (first-key current-page)))))
+
+(defmethod item-at :after ((table table) (index number))
+  (declare (ignore index))
+  (decf (accesses-to-next-eviction table))
+  (when (= (accesses-to-next-eviction table) 0)
+    (evict-to-size (cache table))
+    (setf (accesses-to-next-eviction table)
+          (accesses-to-next-eviction-default table))))
 
 (defmethod current ((table table))
   (when (unanalyzed table)
@@ -682,15 +773,12 @@ as elements of the sequence. The underlying semantics are of MAP."
   (when (finished-iterating table)
     (error "Unable to seek data; iterator finished"))
 
-  (let ((data (item-at table (current-iterator table))))
-;;      (evict-to-size (cache current-page))
-    data))
+  (item-at table (current-iterator table)))
 
 (defmethod next ((table table))
   (if (> (1- (lengthg table)) (current-iterator table) )
       (incf (current-iterator table))
       (setf (finished-iterating table) t)))
-
 
 (defmethod lengthg ((table table))
   (loop for page across (pages table)
@@ -709,9 +797,12 @@ new singular page). Probably a bad idea for large data sets."
              (evict-to-size *page-cache*))
     retval))
 
+;; At present, tables
+(defmethod (setf data) (new-value (table table))
+  (error "Unable to directly set the data on a table"))
+
 (defmethod insertable-page ((table table))
   (aref (pages table) (1- (length (pages table)))))
-
 
 (defmethod insert :before ((table table) (anything t) &key)
   (setf (unanalyzed table) t))
@@ -732,13 +823,11 @@ new singular page). Probably a bad idea for large data sets."
 
 ;; assumes a 2D list structure
 (defmethod bulk-insert ((table table) (rows list))
+  ;; Better implemention would be to create a page w/ the rows and append the page.
   (loop for row in rows
         do
         (insert table row)))
 
-
-(defmethod current ((table table))
-  ())
 
 (defmethod current ((seq list))
   (car seq))
@@ -756,18 +845,38 @@ new singular page). Probably a bad idea for large data sets."
         (let ((table (make-instance 'table :headers '("0" "1" "2")))
               )
 
-          (loop for i from 0 upto 64 by 2
+          (loop for i from 0 upto 32 by 2
                do
                   (insert table
                           (make-page (make-instance 'memory-store)
-                                     (loop for j from (* i 10000)  below (+ (* i 10000) 10000)
-                                           collect `(,j ,(format nil "~a" i) ,(gensym "V"))))))
+                                     (loop for j from (* i 10)  below (+ (* i 10) 10)
+                                           collect `(,j ,(format nil "~a" i) ,(gensym "V") ,(random 1000))))))
           table)))
+
+;;;
+;;; The REF api allows a simple generalized reference approach.
+;;
+;; A ref should be able to point at a column; said column should be
+;; denoted by a header, which should then direct to the appropriate
+;; index.  A ref should also be able to point at a given row, which be
+;; returnable.
+;;
+;; And finally, a cell should be denotable by a combination row and column.
+
+(defgeneric ref (data-frame type selector))
+
+(defmethod ref ((data-frame data-frame) (type (eql :row)) selector)
+  )
+(defmethod ref ((data-frame data-frame) (type (eql :column)) selector))
+(defmethod ref ((data-frame data-frame) (type (eql :cell)) selector))
+
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Finally, the query.
 (defclass query ()
   ())
+
+
 
 ;;; This is the top layer of access to the cl-linq system
 (defgeneric yield (data-frame query &key &allow-other-keys))
@@ -781,15 +890,6 @@ new singular page). Probably a bad idea for large data sets."
 
 ;(defgeneric headers (data-frame &key &allow-other-keys))
 
-
-;;; The REF api allows a simple generalized reference approach.
-
-(defgeneric ref (data-frame type selector))
-
-(defmethod ref ((data-frame data-frame) (type (eql :row)) selector)
-  )
-(defmethod ref ((data-frame data-frame) (type (eql :column)) selector))
-(defmethod ref ((data-frame data-frame) (type (eql :point)) selector))
 
 
 (defmethod where ((obj data-frame) condition &key &allow-other-keys)
