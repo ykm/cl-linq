@@ -86,14 +86,11 @@
   (loop
     for i in a
     for j in b
-    do
-       (if (not (equalg i j))
-           (return-from equal-headers nil)))
-  t)
+    always (equalg i j)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; The data frame forms the fundamental unit of the cl-linq system.
-(defclass data-frame ()
+(defclass data-frame()
   ((headers
     :accessor headers
     :initform nil
@@ -134,16 +131,13 @@
     for i from 0
     collect
     (etypecase h
-      (header
-       h)
-      (number
-       (make-instance 'header
+      (header h)
+      (number (make-instance 'header
                       :canonical-name (format nil "~a" h)
-                      :canonical-index h))
-      (string
-       (make-instance 'header
-                      :canonical-name h
-                      :canonical-index i)))))
+                      :canonical-index h))  
+      (string (make-instance 'header
+                        :canonical-name h
+                        :canonical-index i)))))
 
 (defmethod (setf headers) :after (new-headers (obj data-frame))
   (with-slots (headers)
